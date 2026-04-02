@@ -2,9 +2,9 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const path = require("path");
-const sqlite3 = require("sqlite3").verbose();
+const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
-const multer = require("multer"); // Новий інструмент для файлів
+const multer = require("multer");
 const fs = require("fs");
 
 const app = express();
@@ -18,40 +18,41 @@ app.use(express.json());
 const storage = multer.diskStorage({
   destination: "./public/uploads/",
   filename: (req, file, cb) => {
-    // Даємо файлу унікальне ім'я (час + оригінальне розширення)
     cb(null, "avatar-" + Date.now() + path.extname(file.originalname));
   },
 });
 const upload = multer({ storage: storage });
 
-const db = new sqlite3.Database("./cosmogram.db");
-
-db.serialize(() => {
-  // ДОДАНО: колонка avatar
-  db.run(
-    "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, avatar TEXT)",
-  );
-  db.run(
-    "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, receiver TEXT, text TEXT)",
-  );
-  db.run(
-    "CREATE TABLE IF NOT EXISTS friends (user TEXT, friend TEXT, UNIQUE(user, friend))",
-  );
+// Підключення до хмарної бази даних Neon
+const pool = new Pool({
+  connectionString:
+    "postgresql://neondb_owner:npg_tXNL3QGUh8Zc@ep-mute-unit-als64zjm.c-3.eu-central-1.aws.neon.tech/neondb?sslmode=require",
 });
+
+// Створення таблиць (Синтаксис PostgreSQL)
+pool
+  .query(
+    `
+  CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, avatar TEXT);
+  CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, sender TEXT, receiver TEXT, text TEXT);
+  CREATE TABLE IF NOT EXISTS friends ("user" TEXT, friend TEXT, UNIQUE("user", friend));
+`,
+  )
+  .catch((err) => console.error("Помилка створення таблиць:", err));
 
 app.post("/register", async (req, res) => {
   const { username, password } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    // За замовчуванням генеруємо круту аватарку з першої літери імені!
     const defaultAvatar = `https://ui-avatars.com/api/?name=${username}&background=0D8ABC&color=fff&rounded=true`;
 
-    db.run(
-      "INSERT INTO users (username, password, avatar) VALUES (?, ?, ?)",
+    pool.query(
+      "INSERT INTO users (username, password, avatar) VALUES ($1, $2, $3)",
       [username, hashedPassword, defaultAvatar],
       (err) => {
-        if (err)
+        if (err) {
           return res.status(400).json({ error: "Цей нікнейм вже зайнятий!" });
+        }
         res.json({ success: true });
       },
     );
@@ -62,13 +63,13 @@ app.post("/register", async (req, res) => {
 
 app.post("/login", (req, res) => {
   const { username, password } = req.body;
-  db.get(
-    "SELECT * FROM users WHERE username = ?",
+  pool.query(
+    "SELECT * FROM users WHERE username = $1",
     [username],
-    async (err, row) => {
+    async (err, result) => {
+      const row = result ? result.rows[0] : null;
       if (!row) return res.status(400).json({ error: "Акаунт не знайдено" });
       if (await bcrypt.compare(password, row.password)) {
-        // Відправляємо аватарку разом з успішним логіном
         res.json({ success: true, username: row.username, avatar: row.avatar });
       } else {
         res.status(400).json({ error: "Невірний пароль" });
@@ -77,43 +78,33 @@ app.post("/login", (req, res) => {
   );
 });
 
-// НОВИЙ МАРШРУТ: Завантаження аватарки
 app.post("/upload-avatar", upload.single("avatarImage"), (req, res) => {
   const username = req.body.username;
-  if (!req.file || !username)
+  if (!req.file || !username) {
     return res.status(400).json({ error: "Файл не отримано" });
+  }
 
-  // Шлях до нової картинки
   const avatarUrl = "/uploads/" + req.file.filename;
 
-  // Оновлюємо базу даних
-  db.run(
-    "UPDATE users SET avatar = ? WHERE username = ?",
+  pool.query(
+    "UPDATE users SET avatar = $1 WHERE username = $2",
     [avatarUrl, username],
     (err) => {
       if (err) return res.status(500).json({ error: "Помилка бази" });
-
-      // Сповіщаємо всіх, що цей користувач оновив аватарку
       io.emit("avatarUpdated", { username, avatarUrl });
       res.json({ success: true, avatarUrl });
     },
   );
 });
-
 const userSockets = {};
 
 function sendFriendList(socket, username) {
-  // Тепер ми дістаємо ще й аватарку друга
-  db.all(
-    `
-        SELECT friends.friend, users.avatar 
-        FROM friends 
-        JOIN users ON friends.friend = users.username 
-        WHERE friends.user = ?
-    `,
+  pool.query(
+    'SELECT friends.friend, users.avatar FROM friends JOIN users ON friends.friend = users.username WHERE friends."user" = $1',
     [username],
-    (err, rows) => {
+    (err, result) => {
       if (err) return;
+      const rows = result ? result.rows : [];
       const friends = rows.map((row) => ({
         username: row.friend,
         avatar: row.avatar,
@@ -128,7 +119,6 @@ io.on("connection", (socket) => {
   socket.on("join", (username) => {
     socket.username = username;
     userSockets[username] = socket.id;
-
     io.emit("userStatus", { username: username, isOnline: true });
     sendFriendList(socket, username);
   });
@@ -137,21 +127,24 @@ io.on("connection", (socket) => {
     const me = socket.username;
     if (!me || !friendUsername) return;
 
-    db.get(
-      "SELECT username FROM users WHERE LOWER(username) = LOWER(?)",
+    pool.query(
+      "SELECT username FROM users WHERE LOWER(username) = LOWER($1)",
       [friendUsername],
-      (err, row) => {
-        if (!row)
+      (err, result) => {
+        const row = result ? result.rows[0] : null;
+        if (!row) {
           return socket.emit(
             "friendError",
             `Акаунт "${friendUsername}" не знайдено!`,
           );
+        }
         const exactFriendName = row.username;
-        if (exactFriendName === me)
+        if (exactFriendName === me) {
           return socket.emit("friendError", "Не можна додати себе!");
+        }
 
-        db.run(
-          "INSERT OR IGNORE INTO friends (user, friend) VALUES (?, ?), (?, ?)",
+        pool.query(
+          'INSERT INTO friends ("user", friend) VALUES ($1, $2), ($3, $4) ON CONFLICT DO NOTHING',
           [me, exactFriendName, exactFriendName, me],
           (err) => {
             if (!err) {
@@ -171,12 +164,12 @@ io.on("connection", (socket) => {
 
   socket.on("getHistory", (withUser) => {
     const me = socket.username;
-    db.all(
-      "SELECT * FROM messages WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?) ORDER BY id ASC",
+    pool.query(
+      "SELECT * FROM messages WHERE (sender = $1 AND receiver = $2) OR (sender = $3 AND receiver = $4) ORDER BY id ASC",
       [me, withUser, withUser, me],
-      (err, rows) => {
+      (err, result) => {
         if (err) return;
-        socket.emit("chatHistory", rows);
+        socket.emit("chatHistory", result ? result.rows : []);
       },
     );
   });
@@ -185,14 +178,17 @@ io.on("connection", (socket) => {
     const sender = socket.username;
     if (!sender || !receiver) return;
 
-    db.run(
-      "INSERT INTO messages (sender, receiver, text) VALUES (?, ?, ?)",
+    pool.query(
+      "INSERT INTO messages (sender, receiver, text) VALUES ($1, $2, $3) RETURNING id",
       [sender, receiver, text],
-      function (err) {
+      (err, result) => {
         if (err) return;
-        const messageData = { sender, receiver, text, id: this.lastID };
-        if (userSockets[receiver])
+        const insertedId = result.rows[0].id;
+        const messageData = { sender, receiver, text, id: insertedId };
+
+        if (userSockets[receiver]) {
           io.to(userSockets[receiver]).emit("newPrivateMessage", messageData);
+        }
         socket.emit("newPrivateMessage", messageData);
       },
     );
